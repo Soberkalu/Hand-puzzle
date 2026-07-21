@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pinch Puzzle — Hand Tracking Demo</title>
+<style>
+  :root{
+    --bg: #12121a;
+    --panel: #1b1b26;
+    --line: #33333f;
+    --gold: #e8b23d;
+    --teal: #22d3b8;
+    --text: #eceaf0;
+    --muted: #8d8a9c;
+  }
+  *{box-sizing:border-box;}
+  html,body{
+    margin:0; padding:0; height:100%;
+    background:var(--bg);
+    color:var(--text);
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+    overflow:hidden;
+  }
+  .app{
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+    justify-content:center;
+    height:100%;
+    padding:16px;
+  }
+  header{
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    width:100%;
+    max-width:960px;
+    margin-bottom:10px;
+  }
+  h1{
+    font-size:20px;
+    margin:0;
+    letter-spacing:0.5px;
+  }
+  h1 span{ color:var(--gold); }
+  .controls{
+    display:flex;
+    gap:8px;
+    align-items:center;
+  }
+  select, button{
+    background:var(--panel);
+    color:var(--text);
+    border:1px solid var(--line);
+    border-radius:8px;
+    padding:8px 12px;
+    font-size:13px;
+    cursor:pointer;
+  }
+  button:hover, select:hover{ border-color:var(--gold); }
+  .status{
+    font-size:12px;
+    padding:6px 10px;
+    border-radius:20px;
+    border:1px solid var(--line);
+    color:var(--muted);
+    white-space:nowrap;
+  }
+  .status.on{ color:var(--teal); border-color:var(--teal); }
+  .status.pinch{ color:var(--gold); border-color:var(--gold); }
+
+  .stage-wrap{
+    position:relative;
+    width:min(960px, 96vw);
+    aspect-ratio: 960/600;
+    background:#000;
+    border-radius:14px;
+    overflow:hidden;
+    border:1px solid var(--line);
+    box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+  }
+  canvas{
+    position:absolute;
+    top:0; left:0;
+    width:100%;
+    height:100%;
+  }
+  video{ display:none; }
+
+  .overlay-msg{
+    position:absolute;
+    inset:0;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    flex-direction:column;
+    gap:10px;
+    background:rgba(10,10,16,0.85);
+    text-align:center;
+    padding:20px;
+  }
+  .overlay-msg h2{ margin:0; font-size:22px; }
+  .overlay-msg p{ margin:0; color:var(--muted); font-size:14px; max-width:420px; }
+  .overlay-msg.hidden{ display:none; }
+  .win-badge{
+    font-size:28px;
+    color:var(--gold);
+    font-weight:700;
+  }
+
+  .hint{
+    max-width:960px;
+    width:100%;
+    margin-top:10px;
+    font-size:12px;
+    color:var(--muted);
+    text-align:center;
+  }
+</style>
+</head>
+<body>
+<div class="app">
+
+  <header>
+    <h1>Pinch<span>Puzzle</span></h1>
+    <div class="controls">
+      <select id="gridSize">
+        <option value="3">3 × 3 (easy)</option>
+        <option value="4">4 × 4 (medium)</option>
+        <option value="5">5 × 5 (hard)</option>
+      </select>
+      <button id="shuffleBtn">Shuffle</button>
+      <div class="status" id="statusPill">Loading camera…</div>
+    </div>
+  </header>
+
+  <div class="stage-wrap">
+    <video id="video" playsinline></video>
+    <canvas id="stage" width="960" height="600"></canvas>
+
+    <div class="overlay-msg" id="startOverlay">
+      <h2>Enable your camera to play</h2>
+      <p>This puzzle is controlled entirely by your hand. Pinch your thumb and index finger together over a piece to pick it up, move your hand to drag it, then release the pinch to drop it into place.</p>
+      <button id="startBtn">Start camera</button>
+    </div>
+
+    <div class="overlay-msg hidden" id="winOverlay">
+      <div class="win-badge">Solved! 🎉</div>
+      <p>Nice work. Shuffle again for another round, or bump up the grid size for a harder puzzle.</p>
+      <button id="playAgainBtn">Play again</button>
+    </div>
+  </div>
+
+  <p class="hint">Pinch thumb + index finger together to grab a piece · move your hand to drag it · release to drop it on its numbered slot.</p>
+
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+
+<script>
+(function(){
+  const video = document.getElementById('video');
+  const canvas = document.getElementById('stage');
+  const ctx = canvas.getContext('2d');
+  const statusPill = document.getElementById('statusPill');
+  const startOverlay = document.getElementById('startOverlay');
+  const startBtn = document.getElementById('startBtn');
+  const winOverlay = document.getElementById('winOverlay');
+  const playAgainBtn = document.getElementById('playAgainBtn');
+  const shuffleBtn = document.getElementById('shuffleBtn');
+  const gridSizeSelect = document.getElementById('gridSize');
+
+  const CW = canvas.width, CH = canvas.height;
+
+  // ---------- Puzzle state ----------
+  let GRID = 3;
+  let BOARD = 420;          // board size in px (square)
+  let PIECE = BOARD / GRID;
+  let boardX, boardY;
+  let sourceCanvas = null;  // generated puzzle art
+  let pieces = [];          // {row, col, srcX, srcY, x, y, w, h, solved}
+  let draggingId = null;
+  let dragOffsetX = 0, dragOffsetY = 0;
+  let solvedCount = 0;
+
+  function layoutBoard(){
+    PIECE = BOARD / GRID;
+    boardX = (CW - BOARD) / 2;
+    boardY = (CH - BOARD) / 2;
+  }
+
+  function generateArt(gridSize){
+    const c = document.createElement('canvas');
+    c.width = BOARD; c.height = BOARD;
+    const g = c.getContext('2d');
+
+    const grad = g.createLinearGradient(0,0,BOARD,BOARD);
+    grad.addColorStop(0,'#0f2f2b');
+    grad.addColorStop(0.5,'#123a52');
+    grad.addColorStop(1,'#3a1f4d');
+    g.fillStyle = grad;
+    g.fillRect(0,0,BOARD,BOARD);
+
+    const cell = BOARD / gridSize;
+    const palette = ['#e8b23d','#22d3b8','#e85d5d','#8d6de8','#5de88a','#e88dcf'];
+    let colorIdx = 0;
+
+    for(let r=0;r<gridSize;r++){
+      for(let c2=0;c2<gridSize;c2++){
+        const cx = c2*cell + cell/2;
+        const cy = r*cell + cell/2;
+        g.beginPath();
+        g.fillStyle = palette[colorIdx % palette.length];
+        colorIdx++;
+        g.globalAlpha = 0.55;
+        g.arc(cx, cy, cell*0.32, 0, Math.PI*2);
+        g.fill();
+        g.globalAlpha = 1;
+
+        g.strokeStyle = 'rgba(255,255,255,0.18)';
+        g.lineWidth = 1;
+        g.strokeRect(c2*cell, r*cell, cell, cell);
+
+        const num = r*gridSize + c2 + 1;
+        g.fillStyle = 'rgba(255,255,255,0.92)';
+        g.font = `700 ${Math.floor(cell*0.28)}px Segoe UI, sans-serif`;
+        g.textAlign = 'center';
+        g.textBaseline = 'middle';
+        g.fillText(num, cx, cy);
+      }
+    }
+    return c;
+  }
+
+  function setupPuzzle(gridSize){
+    GRID = gridSize;
+    layoutBoard();
+    sourceCanvas = generateArt(gridSize);
+    pieces = [];
+    solvedCount = 0;
+    winOverlay.classList.add('hidden');
+
+    let idx = 0;
+    for(let r=0;r<GRID;r++){
+      for(let c=0;c<GRID;c++){
+        const targetX = boardX + c*PIECE;
+        const targetY = boardY + r*PIECE;
+        // scatter starting position anywhere on canvas, avoiding exact board overlap bias
+        const startX = Math.random() * (CW - PIECE);
+        const startY = Math.random() * (CH - PIECE);
+        pieces.push({
+          id: idx++,
+          row: r, col: c,
+          srcX: c*PIECE, srcY: r*PIECE,
+          targetX, targetY,
+          x: startX, y: startY,
+          w: PIECE, h: PIECE,
+          solved: false
+        });
+      }
+    }
+  }
+
+  function shuffleLoosePieces(){
+    // re-scatter only unsolved pieces (or all, on manual shuffle)
+    pieces.forEach(p => {
+      p.solved = false;
+      p.x = Math.random() * (CW - p.w);
+      p.y = Math.random() * (CH - p.h);
+    });
+    solvedCount = 0;
+    winOverlay.classList.add('hidden');
+  }
+
+  // ---------- Hand tracking ----------
+  let handsReady = false;
+  let latestLandmarks = null;
+  let isPinching = false;
+  let pointerX = null, pointerY = null;
+
+  function mirrorX(nx){ return CW - nx * CW; }
+  function toY(ny){ return ny * CH; }
+
+  function onResults(results){
+    latestLandmarks = (results.multiHandLandmarks && results.multiHandLandmarks.length > 0)
+      ? results.multiHandLandmarks[0] : null;
+
+    if(latestLandmarks){
+      const thumbTip = latestLandmarks[4];
+      const indexTip = latestLandmarks[8];
+      const wrist = latestLandmarks[0];
+      const middleMcp = latestLandmarks[9];
+
+      const px = mirrorX((thumbTip.x + indexTip.x)/2);
+      const py = toY((thumbTip.y + indexTip.y)/2);
+      pointerX = px; pointerY = py;
+
+      const pinchDist = Math.hypot(
+        (thumbTip.x - indexTip.x) * CW,
+        (thumbTip.y - indexTip.y) * CH
+      );
+      const handSize = Math.hypot(
+        (wrist.x - middleMcp.x) * CW,
+        (wrist.y - middleMcp.y) * CH
+      ) || 1;
+      const ratio = pinchDist / handSize;
+      isPinching = ratio < 0.55;
+    } else {
+      pointerX = null; pointerY = null;
+      isPinching = false;
+      if(draggingId !== null){
+        // hand lost while dragging -> drop in place
+        draggingId = null;
+      }
+    }
+
+    updateDrag();
+    draw(results);
+  }
+
+  function updateDrag(){
+    if(pointerX === null){ return; }
+
+    if(isPinching && draggingId === null){
+      // find topmost piece under pointer (search from end = last drawn = top)
+      for(let i = pieces.length - 1; i >= 0; i--){
+        const p = pieces[i];
+        if(p.solved) continue;
+        if(pointerX >= p.x && pointerX <= p.x + p.w &&
+           pointerY >= p.y && pointerY <= p.y + p.h){
+          draggingId = p.id;
+          dragOffsetX = pointerX - p.x;
+          dragOffsetY = pointerY - p.y;
+          // bring to front
+          pieces.splice(i,1);
+          pieces.push(p);
+          break;
+        }
+      }
+    } else if(isPinching && draggingId !== null){
+      const p = pieces.find(pp => pp.id === draggingId);
+      if(p){
+        p.x = pointerX - dragOffsetX;
+        p.y = pointerY - dragOffsetY;
+      }
+    } else if(!isPinching && draggingId !== null){
+      const p = pieces.find(pp => pp.id === draggingId);
+      if(p){
+        const dist = Math.hypot(p.x - p.targetX, p.y - p.targetY);
+        if(dist < PIECE * 0.35){
+          p.x = p.targetX;
+          p.y = p.targetY;
+          p.solved = true;
+          solvedCount++;
+          if(solvedCount === pieces.length){
+            winOverlay.classList.remove('hidden');
+          }
+        }
+      }
+      draggingId = null;
+    }
+  }
+
+  function draw(results){
+    ctx.clearRect(0,0,CW,CH);
+
+    // mirrored camera feed as background
+    ctx.save();
+    ctx.translate(CW, 0);
+    ctx.scale(-1, 1);
+    try{ ctx.drawImage(video, 0, 0, CW, CH); }catch(e){}
+    ctx.restore();
+    ctx.fillStyle = 'rgba(10,10,16,0.55)';
+    ctx.fillRect(0,0,CW,CH);
+
+    // board slots
+    ctx.strokeStyle = 'rgba(232,178,61,0.6)';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(boardX, boardY, BOARD, BOARD);
+    for(let r=0;r<GRID;r++){
+      for(let c=0;c<GRID;c++){
+        ctx.strokeStyle = 'rgba(255,255,255,0.15)';
+        ctx.strokeRect(boardX + c*PIECE, boardY + r*PIECE, PIECE, PIECE);
+      }
+    }
+
+    // pieces (unsolved drawn with slight shadow, solved flush)
+    pieces.forEach(p => {
+      if(!p.solved){
+        ctx.save();
+        ctx.shadowColor = 'rgba(0,0,0,0.6)';
+        ctx.shadowBlur = 12;
+        ctx.shadowOffsetY = 4;
+      }
+      ctx.drawImage(sourceCanvas, p.srcX, p.srcY, p.w, p.h, p.x, p.y, p.w, p.h);
+      if(!p.solved){
+        ctx.restore();
+        ctx.strokeStyle = (p.id === draggingId) ? 'rgba(34,211,184,0.9)' : 'rgba(255,255,255,0.35)';
+        ctx.lineWidth = (p.id === draggingId) ? 3 : 1;
+        ctx.strokeRect(p.x, p.y, p.w, p.h);
+      }
+    });
+
+    // hand skeleton
+    if(latestLandmarks && window.drawConnectors){
+      ctx.save();
+      ctx.translate(CW, 0);
+      ctx.scale(-1, 1);
+      window.drawConnectors(ctx, latestLandmarks, window.HAND_CONNECTIONS, {color:'rgba(34,211,184,0.5)', lineWidth:2});
+      window.drawLandmarks(ctx, latestLandmarks, {color:'rgba(232,178,61,0.8)', radius:3});
+      ctx.restore();
+    }
+
+    // pointer / pinch indicator
+    if(pointerX !== null){
+      ctx.beginPath();
+      ctx.arc(pointerX, pointerY, isPinching ? 14 : 10, 0, Math.PI*2);
+      ctx.fillStyle = isPinching ? 'rgba(232,178,61,0.9)' : 'rgba(34,211,184,0.7)';
+      ctx.fill();
+    }
+
+    // status pill
+    if(latestLandmarks){
+      statusPill.textContent = isPinching ? 'Pinching' : 'Hand detected';
+      statusPill.className = 'status ' + (isPinching ? 'pinch' : 'on');
+    } else {
+      statusPill.textContent = handsReady ? 'Show your hand' : 'Loading model…';
+      statusPill.className = 'status';
+    }
+  }
+
+  // ---------- MediaPipe setup ----------
+  const hands = new Hands({
+    locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+  });
+  hands.setOptions({
+    maxNumHands: 1,
+    modelComplexity: 1,
+    minDetectionConfidence: 0.7,
+    minTrackingConfidence: 0.6
+  });
+  hands.onResults(onResults);
+  handsReady = true;
+
+  let camera = null;
+
+  async function startCamera(){
+    try{
+      startOverlay.classList.add('hidden');
+      camera = new Camera(video, {
+        onFrame: async () => { await hands.send({image: video}); },
+        width: 960,
+        height: 600
+      });
+      await camera.start();
+    }catch(err){
+      startOverlay.classList.remove('hidden');
+      startOverlay.querySelector('h2').textContent = 'Camera access failed';
+      startOverlay.querySelector('p').textContent = 'Please allow camera permissions in your browser and reload the page. (' + err.message + ')';
+    }
+  }
+
+  startBtn.addEventListener('click', startCamera);
+  playAgainBtn.addEventListener('click', shuffleLoosePieces);
+  shuffleBtn.addEventListener('click', shuffleLoosePieces);
+  gridSizeSelect.addEventListener('change', (e) => {
+    setupPuzzle(parseInt(e.target.value, 10));
+  });
+
+  // init
+  setupPuzzle(GRID);
+})();
+</script>
+</body>
+</html>
